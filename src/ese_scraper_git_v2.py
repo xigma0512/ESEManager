@@ -162,6 +162,8 @@ class ESEScraperGitV2:
         """)
 
         # 建立歌曲檔案表（一首歌可以有多個檔案）
+        # blob_sha = git blob 物件雜湊（sha1("blob <len>\0"+content)）；用來偵測上游
+        # 是否更新過已下載的檔案（本地檔算同一公式比對，內容一變 sha 就變）。
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS song_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,10 +173,16 @@ class ESEScraperGitV2:
                 file_type TEXT,
                 size INTEGER,
                 download_url TEXT,
+                blob_sha TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (song_id) REFERENCES songs (id) ON DELETE CASCADE
             )
         """)
+
+        # 舊資料庫升級：補上 blob_sha 欄位（已存在則略過）
+        existing_cols = {r[1] for r in cursor.execute("PRAGMA table_info(song_files)")}
+        if "blob_sha" not in existing_cols:
+            cursor.execute("ALTER TABLE song_files ADD COLUMN blob_sha TEXT")
 
         # 建立索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_songs_category ON songs(category_id)")
@@ -480,6 +488,7 @@ class ESEScraperGitV2:
         cat_ids = {}       # category name -> id（快取，避免每檔 SELECT/INSERT）
         folder_set = set()  # 統計不重複資料夾數
         current_paths = set()  # 本次 tree 內所有檔案路徑（用於清除已刪除/改名的舊列）
+        path_sha = {}      # file_path -> git blob sha（偵測上游更新用）
         for record in raw.split("\0"):
             if not record:
                 continue
@@ -489,7 +498,7 @@ class ESEScraperGitV2:
             except ValueError:
                 continue
             fields = meta.split()
-            if len(fields) < 2 or fields[1] != "blob":
+            if len(fields) < 3 or fields[1] != "blob":
                 continue  # 只處理 blob（檔案），略過 submodule（commit）等
 
             path = path.replace("\\", "/")
@@ -501,6 +510,7 @@ class ESEScraperGitV2:
             filename = parts[-1]
             base_path = "/".join(parts[:-1])
             current_paths.add(path)
+            path_sha[path] = fields[2]
             song_name = self.get_song_name(filename)
             file_ext = os.path.splitext(filename)[1]
             folder_set.add(base_path)
@@ -561,6 +571,17 @@ class ESEScraperGitV2:
             self.conn.commit()
             print(f"🔧 補上 {len(null_rows)} 個缺少下載連結的檔案")
             self.stats["fixed_urls"] = len(null_rows)
+
+        # 更新 blob_sha（授權性）：insert_song_file 會跳過既有列，故用 file_path 對每個
+        # tree 內的檔案一次寫入目前 sha —— 新列與既有列都會被設成最新值。上游改譜面後
+        # 該檔的 blob sha 會變，GUI 的「檢查更新」比對本地檔算出的 sha 即可發現。
+        if path_sha:
+            cur.executemany(
+                "UPDATE song_files SET blob_sha = ? WHERE file_path = ?",
+                [(sha, fp) for fp, sha in path_sha.items()]
+            )
+            self.conn.commit()
+            print(f"🔑 已記錄 {len(path_sha)} 個檔案的內容雜湊（供檢查更新）")
 
     def scrape(self, keep_clone: bool = False):
         """

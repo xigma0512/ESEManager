@@ -10,6 +10,7 @@ import sys
 import time
 import sqlite3
 import threading
+import hashlib
 import webbrowser
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -113,6 +114,12 @@ TR = {
         "c_oni": "魔王", "c_ura": "裏",
         "f_filter": "篩選", "f_bpm": "BPM 區間", "f_diff": "難度", "f_level": "等級",
         "diff_all": "全部難度", "f_reset": "重設篩選", "f_any": "不限",
+        "check_updates": "🆕 檢查更新",
+        "upd_checking": "檢查更新中（比對本地檔案雜湊）…",
+        "upd_progress": "檢查更新 {d}/{t}",
+        "upd_none": "✓ 所有已下載的歌曲都是最新的",
+        "upd_found": "發現 {n} 首歌有更新（{f} 個檔案），是否重新下載覆蓋？",
+        "upd_no_sha": "此資料庫沒有內容雜湊，請先按「🔄 更新資料庫」再檢查更新。",
         "dan_btn": "🥋 段位工具", "dan_title": "段位工具（Dan）",
         "dan_tab_gen": "段位生成（Wiki）", "dan_tab_conv": "段位變換（tja）",
         "dan_gen_url": "太鼓 Wiki 段位頁面 URL", "dan_out": "輸出資料夾",
@@ -176,6 +183,12 @@ TR = {
         "c_oni": "Oni", "c_ura": "Ura",
         "f_filter": "Filter", "f_bpm": "BPM range", "f_diff": "Difficulty", "f_level": "Level",
         "diff_all": "All difficulties", "f_reset": "Reset filters", "f_any": "Any",
+        "check_updates": "🆕 Check Updates",
+        "upd_checking": "Checking for updates (hashing local files)…",
+        "upd_progress": "Checking updates {d}/{t}",
+        "upd_none": "✓ All downloaded songs are up to date",
+        "upd_found": "{n} songs have updates ({f} files). Re-download and overwrite?",
+        "upd_no_sha": "This database has no content hashes. Click 🔄 Update DB first, then check updates.",
         "dan_btn": "🥋 Dan Tools", "dan_title": "Dan Tools",
         "dan_tab_gen": "Generate (Wiki)", "dan_tab_conv": "Convert (tja)",
         "dan_gen_url": "Taiko Wiki Dan page URL", "dan_out": "Output folder",
@@ -239,6 +252,12 @@ TR = {
         "c_oni": "おに", "c_ura": "裏",
         "f_filter": "絞り込み", "f_bpm": "BPM 範囲", "f_diff": "難易度", "f_level": "レベル",
         "diff_all": "すべて", "f_reset": "リセット", "f_any": "指定なし",
+        "check_updates": "🆕 更新チェック",
+        "upd_checking": "更新をチェック中（ローカルファイルのハッシュ照合）…",
+        "upd_progress": "更新チェック {d}/{t}",
+        "upd_none": "✓ ダウンロード済みの曲はすべて最新です",
+        "upd_found": "{n} 曲に更新があります（{f} ファイル）。再ダウンロードして上書きしますか？",
+        "upd_no_sha": "このデータベースにはハッシュがありません。先に「🔄 データベース更新」を実行してください。",
         "dan_btn": "🥋 段位ツール", "dan_title": "段位ツール（Dan）",
         "dan_tab_gen": "段位生成（Wiki）", "dan_tab_conv": "段位変換（tja）",
         "dan_gen_url": "太鼓 Wiki 段位ページの URL", "dan_out": "出力フォルダ",
@@ -520,6 +539,92 @@ class SearchThread(QThread):
             self.fail.emit(str(e))
 
 
+def git_blob_sha(path):
+    """計算檔案的 git blob 物件雜湊：sha1(b"blob <size>\\0" + content)。
+    與 git ls-tree 給的 blob sha 同一公式，可精準比對本地檔是否為最新版本。"""
+    size = os.path.getsize(path)
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % size)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class CheckUpdatesThread(QThread):
+    """檢查已下載的檔案是否被上游更新（比對 git blob sha）。"""
+    progress = Signal(int, int)     # done, total
+    done = Signal(object)           # list[song]（只含有更新的檔案）
+    fail = Signal(str)
+
+    def __init__(self, download_dir, category=None):
+        super().__init__()
+        self.download_dir = download_dir
+        self.category = category
+
+    def run(self):
+        try:
+            d = SongDownloader(db_path=DB_PATH)
+            songs = d.search_songs(keyword=None, category=self.category)
+            d.close()
+
+            # file_path -> blob_sha（權威值，來自 ese_songs.db）
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                sha_map = {fp: sha for fp, sha in conn.execute(
+                    "SELECT file_path, blob_sha FROM song_files "
+                    "WHERE blob_sha IS NOT NULL AND blob_sha != ''")}
+            finally:
+                conn.close()
+            if not sha_map:
+                # 舊資料庫沒有 blob_sha：請使用者先更新資料庫
+                self.fail.emit("__NO_SHA__")
+                return
+
+            ddir = self.download_dir
+            candidates = []     # (song, file, local_path, remote_sha)
+            for s in songs:
+                for f in s["files"]:
+                    if f["filename"].lower() == "box.def":
+                        continue
+                    sha = sha_map.get(f["file_path"])
+                    if not sha:
+                        continue
+                    lp = os.path.join(ddir, f["file_path"])
+                    if os.path.exists(lp):
+                        candidates.append((s, f, lp, sha))
+
+            total = len(candidates)
+            self.progress.emit(0, total)
+
+            def check(item):
+                s, f, lp, sha = item
+                try:
+                    return (s, f) if git_blob_sha(lp) != sha else None
+                except Exception:
+                    return None
+
+            changed = {}    # id(song) -> song dict（files 只留有更新的）
+            done = 0
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for res in ex.map(check, candidates):
+                    done += 1
+                    if done % 100 == 0 or done == total:
+                        self.progress.emit(done, total)
+                    if res:
+                        s, f = res
+                        key = id(s)
+                        if key not in changed:
+                            entry = dict(s)
+                            entry["files"] = []
+                            changed[key] = entry
+                        changed[key]["files"].append(f)
+
+            self.done.emit(list(changed.values()))
+        except Exception as e:
+            self.fail.emit(str(e))
+
+
 # ---------------------------------------------------------------- 下載執行緒
 # 設計：工作執行緒「不」對每個 chunk 發訊號（下載全部 = 數千檔 × 多並行，會
 # 用跨執行緒訊號灌爆主執行緒事件佇列導致卡死）。改成把進度寫進共用記憶體，
@@ -528,11 +633,12 @@ class DownloadThread(QThread):
     log = Signal(str)
     finished_all = Signal(int, int, int, int)      # downloaded, skipped, failed, total
 
-    def __init__(self, files, download_dir, workers):
+    def __init__(self, files, download_dir, workers, overwrite=False):
         super().__init__()
         self.files = files
         self.download_dir = download_dir
         self.workers = max(1, workers)
+        self.overwrite = overwrite     # True = 覆寫既有檔案（更新用），不跳過
         self._stop = False
         self._pause = threading.Event()
         self._pause.set()         # set = 執行中；clear = 暫停
@@ -583,7 +689,7 @@ class DownloadThread(QThread):
                 return
             save_path = os.path.join(self.download_dir, f["file_path"])
             disp = f["filename"]
-            if os.path.exists(save_path):
+            if os.path.exists(save_path) and not self.overwrite:
                 with self._lock:
                     self.done += 1
                     self.skip += 1
@@ -1902,6 +2008,8 @@ class MainWindow(QMainWindow):
         self.yatai_btn.clicked.connect(self.open_yatai_boxdef)
         self.missing_btn = QPushButton(self.tr("check_missing"))
         self.missing_btn.clicked.connect(self.check_missing)
+        self.updates_btn = QPushButton(self.tr("check_updates"))
+        self.updates_btn.clicked.connect(self.check_updates)
         self.official_btn = QPushButton(self.tr("official"))
         self.official_btn.clicked.connect(lambda: webbrowser.open("https://taiko.ac"))
         self.credits_btn = QPushButton(self.tr("credits_btn"))
@@ -1911,6 +2019,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.dan_btn)
         top.addWidget(self.yatai_btn)
         top.addWidget(self.missing_btn)
+        top.addWidget(self.updates_btn)
         top.addWidget(self.official_btn)
         top.addWidget(self.credits_btn)
         root.addLayout(top)
@@ -2230,7 +2339,7 @@ class MainWindow(QMainWindow):
         files = [(s, f) for s in songs for f in s["files"]]
         self.start_download(files)
 
-    def start_download(self, files):
+    def start_download(self, files, overwrite=False):
         if self.dl_thread and self.dl_thread.isRunning():
             QMessageBox.warning(self, "", "下載進行中…")
             return
@@ -2250,7 +2359,7 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(f"——— 開始下載 {len(files)} 個檔案 ———")
 
         self.dl_thread = DownloadThread(files, self.dir_edit.text(),
-                                        self.workers_spin.value())
+                                        self.workers_spin.value(), overwrite=overwrite)
         self.dl_thread.log.connect(self.log_view.appendPlainText)
         self.dl_thread.finished_all.connect(self.on_download_done)
         self.dl_thread.start()
@@ -2351,6 +2460,42 @@ class MainWindow(QMainWindow):
             self.song_model.set_all(True)
             self.count_label.setText(self.tr("total", n=len(missing)))
             self.start_download(files)
+
+    # ---- check updates（比對 git blob sha，找出上游已更新的已下載檔案）
+    def check_updates(self):
+        ddir = self.dir_edit.text()
+        if not os.path.isdir(ddir):
+            QMessageBox.warning(self, self.tr("check_updates"), self.tr("boxdef_no_dir"))
+            return
+        self.updates_btn.setEnabled(False)
+        self.log_view.appendPlainText("▶ " + self.tr("upd_checking"))
+        self._upd = CheckUpdatesThread(ddir, None)
+        self._upd.progress.connect(
+            lambda d, t: self.count_label.setText(self.tr("upd_progress", d=d, t=t)))
+        self._upd.done.connect(self.on_updates_loaded)
+        self._upd.fail.connect(self._on_updates_fail)
+        self._upd.start()
+
+    def _on_updates_fail(self, e):
+        self.updates_btn.setEnabled(True)
+        if e == "__NO_SHA__":
+            QMessageBox.information(self, self.tr("check_updates"), self.tr("upd_no_sha"))
+        else:
+            QMessageBox.critical(self, self.tr("check_updates"), e)
+
+    def on_updates_loaded(self, songs):
+        self.updates_btn.setEnabled(True)
+        if not songs:
+            QMessageBox.information(self, self.tr("check_updates"), self.tr("upd_none"))
+            return
+        files = [(s, f) for s in songs for f in s["files"]]
+        if QMessageBox.question(
+                self, self.tr("check_updates"),
+                self.tr("upd_found", n=len(songs), f=len(files))) == QMessageBox.Yes:
+            self.song_model.set_songs(songs)
+            self.song_model.set_all(True)
+            self.count_label.setText(self.tr("total", n=len(songs)))
+            self.start_download(files, overwrite=True)   # 覆寫既有檔案
 
     # ---- misc
     def browse_dir(self):
