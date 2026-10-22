@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QPlainTextEdit, QProgressBar, QTabWidget, QListWidget,
     QListWidgetItem, QMessageBox, QSplitter, QAbstractItemView, QStyleFactory,
     QGroupBox, QDialog, QFormLayout, QColorDialog, QFrame, QScrollArea,
-    QTableWidget, QTableWidgetItem
+    QTableWidget, QTableWidgetItem, QCheckBox, QRadioButton
 )
 import re
 
@@ -46,6 +46,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from download_songs import SongDownloader  # noqa: E402
 import dan_tools  # noqa: E402  段位生成/變換（移植自 bluetaiko/SongConvertor）
+import song_sorter  # noqa: E402  曲目街機年代排序與整理器
 
 # TOML
 try:
@@ -79,6 +80,18 @@ CATEGORY_COLORS = {
 
 TR = {
     "zh_TW": {
+        "sorter_btn": "🗂 街機排序",
+        "sorter_title": "🗂 街機曲目整理與排序",
+        "sorter_hint": "依太鼓達人街機（新筐體／虹色版）官方年代由新到舊排序，\n並切分為 99 首分頁目錄（01 001~099 等），相容 TJAPlayer3、TaikoNijiiroDondaEX。",
+        "sorter_src": "來源目錄", "sorter_dst": "輸出目錄",
+        "sorter_opt_reverse": "街機排序模式（最新曲置頂，依年代倒序）",
+        "sorter_opt_pagination": "每 99 首自動分頁（01 001~099, 02 100~198...）",
+        "sorter_opt_boxdef": "自動保留 / 同步 box.def 分類設定檔",
+        "sorter_mode_copy": "複製模式（安全、保留原始檔案）",
+        "sorter_mode_move": "移動模式（直接移至新位置、節省空間）",
+        "sorter_start": "開始整理與排序", "sorter_cancel": "取消",
+        "sorter_done": "整理完成！", "sorter_open_dst": "📂 開啟目標資料夾",
+        "sorter_need_src": "請選擇有效的來源目錄", "sorter_need_dst": "請選擇有效的輸出目錄",
         "title": "🎵 ESEManager", "search": "搜尋", "show_all": "顯示全部",
         "clear": "清除", "ph": "搜尋歌曲名稱 (支援日文)...", "category": "分類",
         "all_cat": "全部分類", "official": "🌐 盅鼓官方網站", "check_missing": "🔍 檢查缺漏",
@@ -147,6 +160,18 @@ TR = {
         "yatai_pick": "選擇顏色",
     },
     "en": {
+        "sorter_btn": "🗂 Arcade Sorter",
+        "sorter_title": "🗂 Arcade Song Sorter",
+        "sorter_hint": "Sorts songs in Taiko arcade (Nijiiro ver.) reverse-chronological order (newest first),\nand chunks into 99-song folders (01 001~099...) for TJAPlayer3 / TaikoNijiiroDondaEX.",
+        "sorter_src": "Source Directory", "sorter_dst": "Output Directory",
+        "sorter_opt_reverse": "Arcade order (newest songs on top)",
+        "sorter_opt_pagination": "Batch into 99-song folders (01 001~099...)",
+        "sorter_opt_boxdef": "Preserve / sync box.def configuration files",
+        "sorter_mode_copy": "Copy mode (safely keep original files)",
+        "sorter_mode_move": "Move mode (move files, saves disk space)",
+        "sorter_start": "Start Sorting", "sorter_cancel": "Cancel",
+        "sorter_done": "Sorting complete!", "sorter_open_dst": "📂 Open Output Folder",
+        "sorter_need_src": "Please select a valid source directory", "sorter_need_dst": "Please select a valid output directory",
         "title": "🎵 ESEManager", "search": "Search", "show_all": "Show All",
         "clear": "Clear", "ph": "Search songs (Japanese supported)...", "category": "Category",
         "all_cat": "All Categories", "official": "🌐 Official Site", "check_missing": "🔍 Check Missing",
@@ -216,6 +241,18 @@ TR = {
         "yatai_pick": "Pick color",
     },
     "ja": {
+        "sorter_btn": "🗂 AC並び替え",
+        "sorter_title": "🗂 アーケード曲順ソーター",
+        "sorter_hint": "太鼓の達人アーケード（新筐体／ニジイロVer.）の公式追加順（最新曲トップ）で並び替え、\n99曲ごとのサブフォルダ（01 001~099など）に自動分割します。",
+        "sorter_src": "元のフォルダ", "sorter_dst": "出力先フォルダ",
+        "sorter_opt_reverse": "アーケード順（新曲を一番上に配置）",
+        "sorter_opt_pagination": "99曲ごとに分割（01 001~099...）",
+        "sorter_opt_boxdef": "box.def 設定ファイルを保持・同期",
+        "sorter_mode_copy": "コピーモード（元のファイルを保持・推奨）",
+        "sorter_mode_move": "移動モード（ファイルを移動して容量節約）",
+        "sorter_start": "並び替えを開始", "sorter_cancel": "キャンセル",
+        "sorter_done": "並び替えが完了しました！", "sorter_open_dst": "📂 出力先フォルダを開く",
+        "sorter_need_src": "有効な元のフォルダを選択してください", "sorter_need_dst": "有効な出力先フォルダを選択してください",
         "title": "🎵 ESEManager", "search": "検索", "show_all": "すべて表示",
         "clear": "クリア", "ph": "楽曲名を検索（日本語対応）...", "category": "カテゴリー",
         "all_cat": "すべて", "official": "🌐 公式サイト", "check_missing": "🔍 不足チェック",
@@ -1870,7 +1907,190 @@ class DanToolsDialog(QDialog):
             QMessageBox.critical(self, self.tr("dan_title"), self.tr("dan_fail", e=info))
 
 
+
+# ---------------------------------------------------------------- 曲目街機排序整理對話框
+class SongSorterDialog(QDialog):
+    """曲目街機排序與分頁整理工具。"""
+
+    def __init__(self, parent, tr, start_dir):
+        super().__init__(parent)
+        self.tr = tr
+        self.start_dir = start_dir
+        self._thread = None
+        self.setWindowTitle(tr("sorter_title"))
+        self.resize(760, 580)
+
+        root = QVBoxLayout(self)
+
+        hint = QLabel(self.tr("sorter_hint"))
+        hint.setStyleSheet("color:#ddd; background:#2A2D32; padding:10px; border-radius:6px;")
+        root.addWidget(hint)
+
+        form = QFormLayout()
+
+        # 來源目錄
+        self.src_edit = QLineEdit(self.start_dir)
+        form.addRow(self.tr("sorter_src"), self._with_browse(self.src_edit, lambda: self._pick_dir(self.src_edit, True)))
+
+        # 目的目錄
+        default_dst = ""
+        if self.start_dir and os.path.isdir(self.start_dir):
+            parent_dir = os.path.dirname(os.path.abspath(self.start_dir))
+            base_name = os.path.basename(os.path.abspath(self.start_dir))
+            if base_name.lower() == 'songs':
+                default_dst = os.path.join(parent_dir, "song_revise")
+            else:
+                default_dst = os.path.join(parent_dir, f"{base_name}_revise")
+        self.dst_edit = QLineEdit(default_dst)
+        form.addRow(self.tr("sorter_dst"), self._with_browse(self.dst_edit, lambda: self._pick_dir(self.dst_edit, False)))
+
+        root.addLayout(form)
+
+        # 選項 GroupBox
+        opts_gb = QGroupBox("設定選項 / Options")
+        opts_layout = QVBoxLayout(opts_gb)
+
+        self.opt_reverse = QCheckBox(self.tr("sorter_opt_reverse"))
+        self.opt_reverse.setChecked(True)
+        opts_layout.addWidget(self.opt_reverse)
+
+        self.opt_pagination = QCheckBox(self.tr("sorter_opt_pagination"))
+        self.opt_pagination.setChecked(True)
+        opts_layout.addWidget(self.opt_pagination)
+
+        self.opt_boxdef = QCheckBox(self.tr("sorter_opt_boxdef"))
+        self.opt_boxdef.setChecked(True)
+        opts_layout.addWidget(self.opt_boxdef)
+
+        mode_row = QHBoxLayout()
+        self.mode_copy = QRadioButton(self.tr("sorter_mode_copy"))
+        self.mode_copy.setChecked(True)
+        self.mode_move = QRadioButton(self.tr("sorter_mode_move"))
+        mode_row.addWidget(self.mode_copy)
+        mode_row.addWidget(self.mode_move)
+        mode_row.addStretch()
+        opts_layout.addLayout(mode_row)
+
+        root.addWidget(opts_gb)
+
+        # 進度條
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m (%p%)")
+        root.addWidget(self.progress_bar)
+
+        # Log 區域
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        root.addWidget(self.log_view, 1)
+
+        # 按鈕列
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton(self.tr("sorter_start"))
+        self.start_btn.setStyleSheet(
+            "QPushButton{background:#1E88E5;color:white;font-weight:bold;padding:9px 18px;border-radius:6px;}"
+            "QPushButton:hover{background:#1976D2;} QPushButton:disabled{background:#555;}"
+        )
+        self.start_btn.clicked.connect(self.run_sorter)
+
+        self.cancel_btn = QPushButton(self.tr("sorter_cancel"))
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_sorter)
+
+        self.open_dst_btn = QPushButton(self.tr("sorter_open_dst"))
+        self.open_dst_btn.setEnabled(False)
+        self.open_dst_btn.clicked.connect(self.open_dst_folder)
+
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self.open_dst_btn)
+        root.addLayout(btn_row)
+
+    def _with_browse(self, edit, fn):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(edit, 1)
+        b = QPushButton(self.tr("browse"))
+        b.clicked.connect(fn)
+        h.addWidget(b)
+        return w
+
+    def _pick_dir(self, edit, is_src=True):
+        d = QFileDialog.getExistingDirectory(self, self.tr("browse"),
+                                             edit.text() or self.start_dir)
+        if d:
+            edit.setText(d)
+            if is_src and not self.dst_edit.text():
+                p_dir = os.path.dirname(os.path.abspath(d))
+                b_name = os.path.basename(os.path.abspath(d))
+                if b_name.lower() == 'songs':
+                    self.dst_edit.setText(os.path.join(p_dir, "song_revise"))
+                else:
+                    self.dst_edit.setText(os.path.join(p_dir, f"{b_name}_revise"))
+
+    def run_sorter(self):
+        src = self.src_edit.text().strip()
+        dst = self.dst_edit.text().strip()
+        if not src or not os.path.isdir(src):
+            QMessageBox.warning(self, self.tr("sorter_title"), self.tr("sorter_need_src"))
+            return
+        if not dst:
+            QMessageBox.warning(self, self.tr("sorter_title"), self.tr("sorter_need_dst"))
+            return
+
+        options = {
+            "reverse_order": self.opt_reverse.isChecked(),
+            "batch_size": 99 if self.opt_pagination.isChecked() else 0,
+            "use_pagination": self.opt_pagination.isChecked(),
+            "sync_boxdef": self.opt_boxdef.isChecked(),
+            "move_mode": self.mode_move.isChecked()
+        }
+
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.open_dst_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.log_view.clear()
+
+        self._thread = song_sorter.SongSorterWorker(src, dst, options)
+        self._thread.sig_progress.connect(self._on_progress)
+        self._thread.sig_log.connect(self._on_log)
+        self._thread.sig_finished.connect(self._on_finished)
+        self._thread.start()
+
+    def cancel_sorter(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.cancel()
+            self.cancel_btn.setEnabled(False)
+
+    def _on_progress(self, cur, total, name):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(cur)
+
+    def _on_log(self, text):
+        self.log_view.appendPlainText(text)
+
+    def _on_finished(self, ok, msg, stats):
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        if ok:
+            self.open_dst_btn.setEnabled(True)
+            QMessageBox.information(self, self.tr("sorter_title"), msg)
+        else:
+            QMessageBox.warning(self, self.tr("sorter_title"), msg)
+
+    def open_dst_folder(self):
+        d = self.dst_edit.text().strip()
+        if os.path.isdir(d):
+            os.startfile(d)
+
+
 # ---------------------------------------------------------------- 主視窗
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2002,6 +2222,9 @@ class MainWindow(QMainWindow):
         self.db_update_btn.clicked.connect(self.update_database)
         self.boxdef_btn = QPushButton(self.tr("boxdef_btn"))
         self.boxdef_btn.clicked.connect(self.open_boxdef)
+        self.sorter_btn = QPushButton(self.tr("sorter_btn"))
+        self.sorter_btn.setToolTip(self.tr("sorter_hint"))
+        self.sorter_btn.clicked.connect(self.open_song_sorter)
         self.dan_btn = QPushButton(self.tr("dan_btn"))
         self.dan_btn.clicked.connect(self.open_dan_tools)
         self.yatai_btn = QPushButton(self.tr("yatai_btn"))
@@ -2016,6 +2239,7 @@ class MainWindow(QMainWindow):
         self.credits_btn.clicked.connect(self.open_credits)
         top.addWidget(self.db_update_btn)
         top.addWidget(self.boxdef_btn)
+        top.addWidget(self.sorter_btn)
         top.addWidget(self.dan_btn)
         top.addWidget(self.yatai_btn)
         top.addWidget(self.missing_btn)
@@ -2513,6 +2737,10 @@ class MainWindow(QMainWindow):
     def open_boxdef(self):
         start = self.dir_edit.text() if os.path.isdir(self.dir_edit.text()) else os.getcwd()
         BoxDefDialog(self, start, self.tr).exec()
+
+    def open_song_sorter(self):
+        start = self.dir_edit.text() if os.path.isdir(self.dir_edit.text()) else os.getcwd()
+        SongSorterDialog(self, self.tr, start).exec()
 
     def open_dan_tools(self):
         start = self.dir_edit.text() if os.path.isdir(self.dir_edit.text()) else os.getcwd()

@@ -7,6 +7,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('../src/download_songs.py', '.'),
+        ('../src/taiko_arcade_data.json', '.'),
     ],
     hiddenimports=[
         'requests',
@@ -20,6 +21,7 @@ a = Analysis(
         'build_local_db',
         'tja_parser',
         'dan_tools',
+        'song_sorter',
         'lxml',
         'lxml.html',
         'lxml.etree',

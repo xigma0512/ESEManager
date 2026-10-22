@@ -15,6 +15,10 @@ from the **ESE (Every Song Ever)** project.
 - One-click **database update**:
   - song list via a *blobless* git clone of ESE (file list only — no audio downloaded)
   - Japanese titles parsed directly from each chart's `TITLEJA` field (incremental — already-known titles are skipped)
+- **Arcade Song Sorter** (🗂):
+  - Sorts downloaded songs in Taiko arcade (Nijiiro ver.) reverse-chronological order (newest songs on top)
+  - Automatically batches songs into 99-song folders (`01 001~099`...) with clean prefixes, ready to play in TJAPlayer3 / TaikoNijiiroDondaEX
+  - Automatically preserves and syncs `box.def` genre definitions
 - **Dan tools** (🥋):
   - **Dan Generator** — turn a Taiko Wiki Dan-dojo page URL into TaikøNauts-compatible Dan files (`dan.def` + per-rank `Dan.json`) from the rank names and clear conditions
   - **Dan Convertor** — convert an OpenTaiko-style Dan `.tja` (multiple songs split by `#NEXTSONG`) into TaikøNauts-compatible Dan files
