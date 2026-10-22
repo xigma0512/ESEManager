@@ -718,6 +718,9 @@ class DownloadThread(QThread):
     def run(self):
         sess = requests.Session()
         sess.headers["User-Agent"] = "ESEManager"
+        adapter = requests.adapters.HTTPAdapter(pool_connections=self.workers, pool_maxsize=self.workers)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
 
         def worker(item):
             song, f = item
@@ -2368,7 +2371,7 @@ class MainWindow(QMainWindow):
         st.addSpacing(20)
         st.addWidget(QLabel("⚡ " + self.tr("workers")))
         self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(1, 16)
+        self.workers_spin.setRange(1, 64)
         self.workers_spin.setValue(self.config.get("download", {}).get("workers", 5))
         self.workers_spin.valueChanged.connect(lambda _: self.save_config())
         st.addWidget(self.workers_spin)

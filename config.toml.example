@@ -4,7 +4,7 @@
 # Download directory (relative or absolute path)
 directory = "Downloads"
 
-# Parallel download threads (1-16)
+# Parallel download threads (1-64)
 workers = 5
 
 [display]
