@@ -15,8 +15,11 @@ import json
 import re
 import html
 import unicodedata
+import stat
+import tempfile
 from datetime import datetime
 from PySide6.QtCore import QThread, Signal
+from tja_parser import TJAParser
 
 # 載入內建太鼓年代資料庫
 def get_data_file():
@@ -32,13 +35,25 @@ def get_data_file():
 _DATA_FILE = get_data_file()
 
 def load_taiko_data():
+    data = {"dates": {}, "ac16_orders": {}, "pinyin_map": {}}
     if os.path.exists(_DATA_FILE):
         try:
             with open(_DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception as e:
             print(f"[SongSorter] Failed to load taiko_arcade_data.json: {e}")
-    return {"dates": {}, "ac16_orders": {}, "pinyin_map": {}}
+    # 支援外部覆寫/補丁檔 custom_arcade_data.json
+    custom_p = os.path.join(os.path.dirname(_DATA_FILE), "custom_arcade_data.json")
+    if os.path.exists(custom_p):
+        try:
+            with open(custom_p, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+                data.setdefault("dates", {}).update(cdata.get("dates", {}))
+                data.setdefault("ac16_orders", {}).update(cdata.get("ac16_orders", {}))
+                data.setdefault("pinyin_map", {}).update(cdata.get("pinyin_map", {}))
+        except Exception as e:
+            print(f"[SongSorter] Failed to load custom_arcade_data.json: {e}")
+    return data
 
 _TAIKO_DATA = load_taiko_data()
 _PINYIN_MAP = _TAIKO_DATA.get("pinyin_map", {})
@@ -67,43 +82,31 @@ def clean_key(s):
 def normalize_date(d_str):
     """將各種格式日期轉為標準 YYYY-MM-DD"""
     if not d_str:
-        return "2010-01-01"
+        return ""
     d_str = str(d_str).replace('/', '-')
     parts = d_str.split('-')
     try:
-        if len(parts) == 3:
-            return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
-        elif len(parts) == 2:
-            return f"{int(parts[0]):04d}-{int(parts[1]):02d}-01"
-        elif len(parts) == 1 and len(parts[0]) == 4:
-            return f"{int(parts[0]):04d}-01-01"
-    except Exception:
+        if 1 <= len(parts) <= 3 and len(parts[0]) == 4:
+            year, month, day = [int(p) for p in parts] + [1] * (3 - len(parts))
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
         pass
-    return "2010-01-01"
+    return ""
 
 def extract_tja_titles(song_dir):
     """解析資料夾內的 .tja 取得 TITLE 與 TITLEJA"""
     titles = []
-    tjas = [f for f in os.listdir(song_dir) if f.lower().endswith('.tja')]
-    if not tjas:
-        return titles
-    tja_path = os.path.join(song_dir, tjas[0])
-    for enc in ['cp932', 'shift_jis', 'utf-8', 'utf-8-sig']:
-        try:
-            with open(tja_path, 'r', encoding=enc) as f:
-                for line in f:
-                    if line.startswith('#START'):
-                        break
-                    if ':' in line:
-                        fld, val = line.split(':', 1)
-                        if fld.strip().upper() in ['TITLE', 'TITLEJA']:
-                            val_clean = val.strip()
-                            if val_clean and val_clean not in titles:
-                                titles.append(val_clean)
-            if titles:
-                break
-        except Exception:
+    parser = TJAParser()
+    for filename in sorted(os.listdir(song_dir)):
+        if not filename.lower().endswith('.tja'):
             continue
+        with open(os.path.join(song_dir, filename), 'rb') as f:
+            text = parser.decode_bytes(f.read())
+        metadata = parser.parse_text(text or "")
+        for field in ('title', 'titleja'):
+            title = metadata.get(field, '').strip()
+            if title and title not in titles:
+                titles.append(title)
     return titles
 
 def resolve_song_metadata(dirname, song_dir):
@@ -136,15 +139,29 @@ def resolve_song_metadata(dirname, song_dir):
             ac16_order = _AC16_ORDERS[k]
             break
 
-    norm_d = normalize_date(resolved_date) if resolved_date else "2010-01-01"
-    clean_name = re.sub(r'^\d{2}\s+', '', dirname)
+    norm_d = normalize_date(resolved_date)
+    # 加上文字前綴比對，讓 clean_key 不會將真正的數字曲名當成排序序號。
+    title_matches = any(clean_key('title ' + dirname) == clean_key('title ' + title)
+                        for title in tja_titles)
+    clean_name = dirname if title_matches else re.sub(r'^\d{2,}\s+', '', dirname)
     
     return {
         'clean_name': clean_name,
         'date': norm_d,
         'ac16_order': ac16_order if ac16_order is not None else 99999,
-        'has_known_date': bool(resolved_date)
+        'has_known_date': bool(norm_d)
     }
+
+def default_backup_dir(source):
+    source = os.path.abspath(source)
+    name = os.path.basename(source)
+    return os.path.join(os.path.dirname(source),
+                        "song_backup" if name.lower() == "songs" else name + "_backup")
+
+
+class _SortCancelled(Exception):
+    pass
+
 
 class SongSorterWorker(QThread):
     """Qt 背景執行緒，執行曲目整理與排序"""
@@ -163,170 +180,174 @@ class SongSorterWorker(QThread):
         self.reverse_order = self.options.get("reverse_order", True)  # True = 新曲置頂（街機順序）
         self.batch_size = self.options.get("batch_size", 99)          # 每資料夾曲數（預設 99）
         self.use_pagination = self.options.get("use_pagination", True)# 是否使用 01 001~099 分頁
-        self.move_mode = self.options.get("move_mode", False)         # True = 移動, False = 複製
-        self.sync_boxdef = self.options.get("sync_boxdef", True)      # 同步 box.def
 
     def cancel(self):
         self.is_cancelled = True
 
+    def _check_cancel(self):
+        if self.is_cancelled:
+            raise _SortCancelled("作業已取消，原曲庫未變更。")
+
+    @staticmethod
+    def _raise_walk_error(error):
+        raise error
+
+    def _validate_paths(self):
+        if not os.path.isdir(self.src_dir):
+            raise ValueError(f"來源目錄不存在: {self.src_dir}")
+        parent = os.path.dirname(self.src_dir)
+        if self.src_dir == parent:
+            raise ValueError("請選擇曲庫目錄，不能使用磁碟根目錄。")
+        backup_parent = os.path.normcase(os.path.realpath(os.path.dirname(self.dst_dir)))
+        if backup_parent != os.path.normcase(os.path.realpath(parent)) or (
+                os.path.normcase(self.src_dir) == os.path.normcase(self.dst_dir)):
+            raise ValueError("備份目錄必須與來源目錄放在同一層，且名稱不同。")
+        # 禁止複製連結到曲庫外的資料，再將該連結誤當成已備份的檔案。
+        snapshot = {}
+        for root, dirs, files in os.walk(self.src_dir, onerror=self._raise_walk_error):
+            self._check_cancel()
+            for path in [root] + [os.path.join(root, n) for n in dirs + files]:
+                info = os.lstat(path)
+                if (stat.S_ISLNK(info.st_mode) or
+                        getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    raise ValueError(f"曲庫含有符號連結或接合點，請先處理: {path}")
+                snapshot[os.path.relpath(path, self.src_dir)] = (info.st_size, info.st_mtime_ns)
+        return snapshot
+
+    def _collect_songs(self):
+        entries = sorted(d for d in os.listdir(self.src_dir)
+                         if os.path.isdir(os.path.join(self.src_dir, d))
+                         and not d.startswith('.') and d not in ('__pycache__', 'System', 'GameData'))
+        has_direct_songs = any(
+            any(f.lower().endswith('.tja') for f in os.listdir(os.path.join(self.src_dir, d)))
+            for d in entries)
+        has_pages = any(re.fullmatch(r'\d+\s+\d+~\d*', d) for d in entries)
+        if any(f.lower().endswith('.tja') for f in os.listdir(self.src_dir)):
+            raise ValueError("請選擇曲庫或分類目錄，而非單首歌曲資料夾。")
+        categories = [("", self.src_dir)] if has_direct_songs or has_pages else [
+            (d, os.path.join(self.src_dir, d)) for d in entries]
+        result = {}
+        for category, path in categories:
+            songs = []
+            for root, dirs, files in os.walk(path, onerror=self._raise_walk_error):
+                self._check_cancel()
+                if any(f.lower().endswith('.tja') for f in files):
+                    meta = resolve_song_metadata(os.path.basename(root), root)
+                    meta['relative_path'] = os.path.relpath(root, self.src_dir)
+                    songs.append(meta)
+                    dirs[:] = []  # 歌曲內的子目錄屬於同一首曲目的資產。
+            if songs:
+                result[category] = songs
+                self.sig_log.emit(f"  • [{category or '根目錄'}] 找到 {len(songs)} 首曲目")
+        return result
+
+    def _arrange_songs(self, library, holding, categories, stats):
+        # 先移出所有歌曲，避免舊序號與新序號互相覆蓋。
+        os.mkdir(holding)
+        count = 0
+        for songs in categories.values():
+            for song in songs:
+                self._check_cancel()
+                temporary_path = os.path.join(holding, str(count))
+                os.rename(os.path.join(library, song['relative_path']), temporary_path)
+                song['staged_path'] = temporary_path
+                count += 1
+        for root, dirs, files in os.walk(library, topdown=False):
+            if root != library and not os.listdir(root):
+                os.rmdir(root)
+        for category, songs in categories.items():
+            # 穩定排序：同日順位與曲名升序；未知日期在兩種模式都排最後。
+            songs.sort(key=lambda s: (s['ac16_order'], s['clean_name'].casefold(), s['relative_path']))
+            songs.sort(key=lambda s: s['date'], reverse=self.reverse_order)
+            songs.sort(key=lambda s: not s['has_known_date'])
+            size = self.batch_size if self.use_pagination and self.batch_size > 0 else len(songs)
+            for index, song in enumerate(songs):
+                self._check_cancel()
+                target = os.path.join(library, category)
+                if self.use_pagination and self.batch_size > 0:
+                    page = index // size
+                    end = str((page + 1) * size).zfill(3) if (page + 1) * size < len(songs) else ""
+                    target = os.path.join(target, f"{page + 1:02d} {page * size + 1:03d}~{end}")
+                os.makedirs(target, exist_ok=True)
+                target = os.path.join(target, f"{index % size + 1:02d} {song['clean_name']}")
+                if os.path.lexists(target):
+                    raise FileExistsError(f"排序目標已存在，已停止以避免覆寫: {target}")
+                os.rename(song['staged_path'], target)
+                if not song['has_known_date']:
+                    stats['unknown_dates'].append(song['clean_name'])
+                    self.sig_log.emit(f"⚠ 日期未知，排至分類末尾: {song['clean_name']}")
+                stats['processed'] += 1
+                self.sig_progress.emit(stats['processed'], stats['total'], song['clean_name'])
+
+    def _install_library(self, library):
+        backup = self.dst_dir
+        suffix = 2
+        while os.path.lexists(backup):
+            backup = f"{self.dst_dir}_{suffix}"
+            suffix += 1
+        self._check_cancel()
+        os.rename(self.src_dir, backup)
+        try:
+            os.rename(library, self.src_dir)
+        except Exception as install_error:
+            try:
+                os.rename(backup, self.src_dir)
+            except Exception as restore_error:
+                raise OSError(f"替換失敗: {install_error}；自動還原失敗: {restore_error}。"
+                              f"完整原曲庫保留在: {backup}") from install_error
+            raise OSError(f"替換失敗，已還原原曲庫: {install_error}") from install_error
+        return backup
+
     def run(self):
         start_time = time.time()
-        self.sig_log.emit(f"🚀 開始曲目整理作業...")
-        self.sig_log.emit(f"📂 來源路徑: {self.src_dir}")
-        self.sig_log.emit(f"📁 目的路徑: {self.dst_dir}")
-        self.sig_log.emit(f"⚙️ 模式: {'街機新曲置頂' if self.reverse_order else '老歌正序'} | "
-                          f"分頁: {'每 ' + str(self.batch_size) + ' 首' if self.use_pagination else '不分頁'} | "
-                          f"操作: {'移動' if self.move_mode else '複製'}")
+        work_dir = None
+        stats = {'processed': 0, 'total': 0, 'unknown_dates': []}
+        ok = False
+        self.sig_log.emit(f"📂 整理後替換原曲庫: {self.src_dir}")
+        try:
+            self._check_cancel()
+            original_snapshot = self._validate_paths()
+            categories = self._collect_songs()
+            stats['total'] = sum(len(songs) for songs in categories.values())
+            if not stats['total']:
+                raise ValueError("未在來源目錄中找到任何含有 .tja 的曲目資料夾。")
+            work_dir = tempfile.mkdtemp(prefix=f".{os.path.basename(self.src_dir)}-sort-",
+                                        dir=os.path.dirname(self.src_dir))
+            library = os.path.join(work_dir, 'library')
+            copied = 0
 
-        if not os.path.exists(self.src_dir):
-            self.sig_finished.emit(False, f"來源路徑不存在: {self.src_dir}", {})
-            return
+            def copy_file(src, dst):
+                nonlocal copied
+                self._check_cancel()
+                shutil.copy2(src, dst)
+                copied += 1
+                if copied % 100 == 0:
+                    self.sig_log.emit(f"📋 已複製 {copied} 個檔案至暫存目錄")
+                self._check_cancel()
 
-        os.makedirs(self.dst_dir, exist_ok=True)
-
-        # 1. 偵測曲目分類結構
-        # 判斷是「分類目錄」（包含多個分類如 01-J-POP、02 Anime）或「單一曲庫目錄」
-        entries = [d for d in os.listdir(self.src_dir) if os.path.isdir(os.path.join(self.src_dir, d))]
-        
-        # 檢測各子目錄中是否包含 .tja（若直接就是歌曲資料夾）
-        has_direct_songs = False
-        for e in entries[:10]:
-            ep = os.path.join(self.src_dir, e)
-            if any(f.lower().endswith('.tja') for f in os.listdir(ep)):
-                has_direct_songs = True
-                break
-
-        categories = []
-        if has_direct_songs:
-            # 來源目錄本身就是單一分類或扁平曲目
-            categories = [("", self.src_dir)]
-        else:
-            # 來源目錄包含多個分類資料夾（或包含舊分頁目錄）
-            for e in sorted(entries):
-                ep = os.path.join(self.src_dir, e)
-                # 排除系統資料夾
-                if e.startswith('.') or e in ['__pycache__', 'System', 'GameData']:
-                    continue
-                categories.append((e, ep))
-
-        self.sig_log.emit(f"🔍 偵測到 {len(categories)} 個分類群組，開始掃描曲目...")
-
-        # 2. 收集各分類的全部歌曲
-        all_categorized_songs = {}
-        total_songs_found = 0
-
-        for cat_name, cat_path in categories:
-            cat_songs = []
-            for root, dirs, files in os.walk(cat_path):
-                if any(f.lower().endswith('.tja') for f in files):
-                    dirname = os.path.basename(root)
-                    meta = resolve_song_metadata(dirname, root)
-                    cat_songs.append({
-                        'dirname': dirname,
-                        'clean_name': meta['clean_name'],
-                        'src_path': root,
-                        'date': meta['date'],
-                        'ac16_order': meta['ac16_order'],
-                        'has_known_date': meta['has_known_date']
-                    })
-            if cat_songs:
-                all_categorized_songs[cat_name] = cat_songs
-                total_songs_found += len(cat_songs)
-                self.sig_log.emit(f"  • [{cat_name or '根目錄'}] 找到 {len(cat_songs)} 首曲目")
-
-        if total_songs_found == 0:
-            self.sig_finished.emit(False, "未在來源目錄中找到任何含有 .tja 的曲目資料夾！", {})
-            return
-
-        self.sig_log.emit(f"📊 總計發現 {total_songs_found} 首曲目，準備開始排序與寫入...")
-
-        processed_count = 0
-
-        # 3. 對每個分類執行排序與輸出
-        for cat_name, songs in all_categorized_songs.items():
-            if self.is_cancelled:
-                self.sig_log.emit("⚠️ 使用者已取消作業。")
-                self.sig_finished.emit(False, "作業已被使用者中止", {"processed": processed_count, "total": total_songs_found})
-                return
-
-            # 目標分類目錄
-            cat_target_dir = os.path.join(self.dst_dir, cat_name) if cat_name else self.dst_dir
-            os.makedirs(cat_target_dir, exist_ok=True)
-
-            # 同步或複製 box.def
-            if self.sync_boxdef and cat_name:
-                box_src = os.path.join(self.src_dir, cat_name, 'box.def')
-                box_dst = os.path.join(cat_target_dir, 'box.def')
-                if os.path.exists(box_src) and not os.path.exists(box_dst):
-                    try:
-                        shutil.copy2(box_src, box_dst)
-                    except Exception:
-                        pass
-
-            # 排序曲目：
-            # 若 reverse_order 為 True（街機順序）：date 降序（最新在上），ac16_order 升序，clean_name
-            # 若為 False：date 升序（最舊在上）
-            if self.reverse_order:
-                songs.sort(key=lambda x: (x['date'], -x['ac16_order'], x['clean_name']), reverse=True)
-            else:
-                songs.sort(key=lambda x: (x['date'], x['ac16_order'], x['clean_name']))
-
-            # 分頁處理
-            total_in_cat = len(songs)
-            if self.use_pagination and self.batch_size > 0:
-                num_batches = (total_in_cat + self.batch_size - 1) // self.batch_size
-            else:
-                num_batches = 1
-
-            for b in range(num_batches):
-                if self.is_cancelled:
-                    break
-
-                if self.use_pagination and self.batch_size > 0:
-                    start_idx = b * self.batch_size
-                    end_idx = min((b + 1) * self.batch_size, total_in_cat)
-                    batch_songs = songs[start_idx:end_idx]
-                    start_song_num = start_idx + 1
-
-                    if b == num_batches - 1:
-                        batch_folder_name = f"{b+1:02d} {start_song_num:03d}~"
-                    else:
-                        batch_folder_name = f"{b+1:02d} {start_song_num:03d}~{(b+1)*self.batch_size:03d}"
-
-                    batch_target_dir = os.path.join(cat_target_dir, batch_folder_name)
-                else:
-                    batch_songs = songs
-                    batch_target_dir = cat_target_dir
-
-                os.makedirs(batch_target_dir, exist_ok=True)
-
-                for idx_in_batch, s in enumerate(batch_songs, start=1):
-                    if self.is_cancelled:
-                        break
-
-                    new_folder_name = f"{idx_in_batch:02d} {s['clean_name']}"
-                    dest_song_dir = os.path.join(batch_target_dir, new_folder_name)
-
-                    try:
-                        if self.move_mode and s['src_path'] != dest_song_dir:
-                            if os.path.exists(dest_song_dir):
-                                shutil.rmtree(dest_song_dir)
-                            shutil.move(s['src_path'], dest_song_dir)
-                        elif s['src_path'] != dest_song_dir:
-                            if os.path.exists(dest_song_dir):
-                                shutil.rmtree(dest_song_dir)
-                            shutil.copytree(s['src_path'], dest_song_dir)
-                    except Exception as ex:
-                        self.sig_log.emit(f"  ❌ 處理失敗 [{s['clean_name']}]: {ex}")
-
-                    processed_count += 1
-                    self.sig_progress.emit(processed_count, total_songs_found, s['clean_name'])
-
-        elapsed = time.time() - start_time
-        msg = f"曲目整理完成！共處理 {processed_count} 首曲目，耗時 {elapsed:.2f} 秒。"
-        self.sig_log.emit(f"🎉 {msg}")
-        self.sig_finished.emit(True, msg, {
-            "processed": processed_count,
-            "total": total_songs_found,
-            "elapsed": elapsed
-        })
+            self.sig_log.emit("📋 複製完整曲庫至暫存目錄，保留 box.def、段位及其他資產…")
+            shutil.copytree(self.src_dir, library, copy_function=copy_file)
+            self._arrange_songs(library, os.path.join(work_dir, 'holding'), categories, stats)
+            if self._validate_paths() != original_snapshot:
+                raise OSError("來源曲庫在整理期間有變更，已停止替換。請先停止下載或編輯後重試。")
+            self.sig_log.emit("📦 排序完成，正在備份並替換原曲庫…")
+            stats['backup_path'] = self._install_library(library)
+            stats['output_path'] = self.src_dir
+            stats['elapsed'] = time.time() - start_time
+            message = (f"已整理 {stats['processed']} 首並替換原曲庫。\n"
+                       f"完整備份: {stats['backup_path']}\n"
+                       f"日期未知: {len(stats['unknown_dates'])} 首（已排至各分類末尾）。")
+            ok = True
+        except Exception as error:
+            message = str(error)
+        finally:
+            if work_dir:
+                try:
+                    # 僅清除此輪建立、且位於來源同層的暫存目錄。
+                    if os.path.dirname(os.path.realpath(work_dir)) != os.path.realpath(os.path.dirname(self.src_dir)):
+                        raise ValueError("暫存目錄位置異常，已保留。")
+                    shutil.rmtree(work_dir)
+                except (OSError, ValueError) as error:
+                    self.sig_log.emit(f"⚠ 暫存目錄清理失敗: {work_dir}: {error}")
+        self.sig_log.emit(message)
+        self.sig_finished.emit(ok, message, stats)

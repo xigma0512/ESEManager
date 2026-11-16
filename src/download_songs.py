@@ -11,6 +11,29 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from urllib.parse import urlsplit, urlunsplit
+
+
+LFS_HEADER = b"version https://git-lfs.github.com/spec/v1"
+
+
+def media_url(url):
+    """Gitea's media route resolves LFS pointers to the actual file content."""
+    if not url:
+        return url
+    parts = urlsplit(url)
+    if parts.hostname in ("git.vanillaaaa.org", "ese.tjadataba.se"):
+        parts = parts._replace(scheme="https", netloc="ese.tjadataba.se",
+                               path=parts.path.replace("/ESE/ESE/raw/", "/ESE/ESE/media/", 1))
+    return urlunsplit(parts)
+
+
+def is_lfs_pointer(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(len(LFS_HEADER)) == LFS_HEADER
+    except OSError:
+        return False
 
 # 修復 Windows 控制台編碼問題
 if sys.platform == 'win32':
@@ -210,7 +233,7 @@ class SongDownloader:
         """
         try:
             # 檢查檔案是否已存在
-            if os.path.exists(save_path):
+            if os.path.exists(save_path) and not is_lfs_pointer(save_path):
                 safe_print(f"  ⊘ 已存在: {os.path.basename(save_path)}")
                 self.stats["skipped"] += 1
                 return True
@@ -219,7 +242,7 @@ class SongDownloader:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
             # 下載
-            response = requests.get(url, stream=True, timeout=60)
+            response = requests.get(media_url(url), stream=True, timeout=60)
             response.raise_for_status()
 
             total_size = int(response.headers.get('content-length', 0)) or file_size or 0
@@ -230,6 +253,9 @@ class SongDownloader:
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+
+            if is_lfs_pointer(save_path):
+                raise ValueError("Server returned a Git LFS pointer instead of file content")
 
             # 顯示檔案大小
             size_mb = downloaded / 1024 / 1024

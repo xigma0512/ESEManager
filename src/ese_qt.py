@@ -11,6 +11,9 @@ import time
 import sqlite3
 import threading
 import hashlib
+import tempfile
+from contextlib import closing
+from pathlib import Path
 import webbrowser
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -20,10 +23,8 @@ ESE_RAW_BASE = "https://ese.tjadataba.se/ESE/ESE/raw/branch/master/"
 
 
 def _live_url(url):
-    """把舊 host 換成 live host，讓舊版資料庫的連結仍可用。"""
-    if not url:
-        return url
-    return url.replace("git.vanillaaaa.org", "ese.tjadataba.se")
+    """兼容舊網址並取得真正的 LFS 音檔。"""
+    return media_url(url)
 
 import requests
 import urllib3
@@ -44,7 +45,7 @@ import re
 
 # 確保能 import 同目錄的 download_songs
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from download_songs import SongDownloader  # noqa: E402
+from download_songs import SongDownloader, media_url, is_lfs_pointer, LFS_HEADER  # noqa: E402
 import dan_tools  # noqa: E402  段位生成/變換（移植自 bluetaiko/SongConvertor）
 import song_sorter  # noqa: E402  曲目街機年代排序與整理器
 
@@ -82,19 +83,21 @@ TR = {
     "zh_TW": {
         "sorter_btn": "🗂 街機排序",
         "sorter_title": "🗂 街機曲目整理與排序",
-        "sorter_hint": "依太鼓達人街機（新筐體／虹色版）官方年代由新到舊排序，\n並切分為 99 首分頁目錄（01 001~099 等），相容 TJAPlayer3、TaikoNijiiroDondaEX。",
-        "sorter_src": "來源目錄", "sorter_dst": "輸出目錄",
+        "sorter_hint": "依內建街機上架日期排序，未知日期排在各分類最後；可切分為 99 首分頁。\n完成後先備份完整原曲庫，再將排序結果放回原路徑。需要額外一份曲庫的空間。",
+        "sorter_src": "來源曲庫（整理後替換）", "sorter_dst": "備份目錄（與來源同層）",
         "sorter_opt_reverse": "街機排序模式（最新曲置頂，依年代倒序）",
         "sorter_opt_pagination": "每 99 首自動分頁（01 001~099, 02 100~198...）",
-        "sorter_opt_boxdef": "自動保留 / 同步 box.def 分類設定檔",
-        "sorter_mode_copy": "複製模式（安全、保留原始檔案）",
-        "sorter_mode_move": "移動模式（直接移至新位置、節省空間）",
-        "sorter_start": "開始整理與排序", "sorter_cancel": "取消",
-        "sorter_done": "整理完成！", "sorter_open_dst": "📂 開啟目標資料夾",
-        "sorter_need_src": "請選擇有效的來源目錄", "sorter_need_dst": "請選擇有效的輸出目錄",
+        "sorter_start": "開始排序、備份並替換", "sorter_cancel": "取消",
+        "sorter_done": "整理完成！", "sorter_open_dst": "📂 開啟整理後曲庫",
+        "sorter_need_src": "請選擇有效的來源目錄", "sorter_need_dst": "請設定備份目錄",
+        "sorter_busy": "請先完成或停止下載，再整理曲庫。",
         "title": "🎵 ESEManager", "search": "搜尋", "show_all": "顯示全部",
         "clear": "清除", "ph": "搜尋歌曲名稱 (支援日文)...", "category": "分類",
         "all_cat": "全部分類", "official": "🌐 盅鼓官方網站", "check_missing": "🔍 檢查缺漏",
+        "miss_checking": "正在掃描本地曲庫並比對缺漏…",
+        "miss_progress": "正在檢查缺漏… ({d}/{t})",
+        "miss_none": "✓ 沒有缺漏，所有曲目皆已存在於本地",
+        "miss_found": "發現 {n} 首缺漏曲目（共 {f} 檔），已載入清單。\n是否立即下載？",
         "download": "⬇ 下載選中的歌曲", "sel_all": "全選", "desel_all": "取消",
         "selected": "已選擇 {n} 首", "dir": "下載目錄", "browse": "瀏覽", "workers": "並行數",
         "lang": "語言", "c_sel": "✓", "c_song": "歌曲名稱", "c_jp": "日文標題",
@@ -162,19 +165,21 @@ TR = {
     "en": {
         "sorter_btn": "🗂 Arcade Sorter",
         "sorter_title": "🗂 Arcade Song Sorter",
-        "sorter_hint": "Sorts songs in Taiko arcade (Nijiiro ver.) reverse-chronological order (newest first),\nand chunks into 99-song folders (01 001~099...) for TJAPlayer3 / TaikoNijiiroDondaEX.",
-        "sorter_src": "Source Directory", "sorter_dst": "Output Directory",
+        "sorter_hint": "Sort by bundled arcade release dates; unknown dates go last in each category. Optional 99-song pages.\nBack up the complete original library, then replace it with the sorted result. Requires space for a full copy.",
+        "sorter_src": "Source library (will be replaced)", "sorter_dst": "Backup directory (same parent)",
         "sorter_opt_reverse": "Arcade order (newest songs on top)",
         "sorter_opt_pagination": "Batch into 99-song folders (01 001~099...)",
-        "sorter_opt_boxdef": "Preserve / sync box.def configuration files",
-        "sorter_mode_copy": "Copy mode (safely keep original files)",
-        "sorter_mode_move": "Move mode (move files, saves disk space)",
-        "sorter_start": "Start Sorting", "sorter_cancel": "Cancel",
-        "sorter_done": "Sorting complete!", "sorter_open_dst": "📂 Open Output Folder",
-        "sorter_need_src": "Please select a valid source directory", "sorter_need_dst": "Please select a valid output directory",
+        "sorter_start": "Sort, Back Up and Replace", "sorter_cancel": "Cancel",
+        "sorter_done": "Sorting complete!", "sorter_open_dst": "📂 Open Sorted Library",
+        "sorter_need_src": "Please select a valid source directory", "sorter_need_dst": "Please set a backup directory",
+        "sorter_busy": "Finish or stop downloads before sorting the library.",
         "title": "🎵 ESEManager", "search": "Search", "show_all": "Show All",
         "clear": "Clear", "ph": "Search songs (Japanese supported)...", "category": "Category",
         "all_cat": "All Categories", "official": "🌐 Official Site", "check_missing": "🔍 Check Missing",
+        "miss_checking": "Scanning local directory and checking for missing charts…",
+        "miss_progress": "Checking missing charts… ({d}/{t})",
+        "miss_none": "✓ No missing charts, all songs present locally",
+        "miss_found": "Found {n} missing songs ({f} files) loaded into table.\nDownload now?",
         "download": "⬇ Download Selected", "sel_all": "Select All", "desel_all": "Deselect",
         "selected": "{n} selected", "dir": "Download Dir", "browse": "Browse", "workers": "Workers",
         "lang": "Language", "c_sel": "✓", "c_song": "Song", "c_jp": "Japanese",
@@ -243,19 +248,21 @@ TR = {
     "ja": {
         "sorter_btn": "🗂 AC並び替え",
         "sorter_title": "🗂 アーケード曲順ソーター",
-        "sorter_hint": "太鼓の達人アーケード（新筐体／ニジイロVer.）の公式追加順（最新曲トップ）で並び替え、\n99曲ごとのサブフォルダ（01 001~099など）に自動分割します。",
-        "sorter_src": "元のフォルダ", "sorter_dst": "出力先フォルダ",
+        "sorter_hint": "内蔵のアーケード追加日で並び替え、日付不明の曲は各ジャンルの末尾に配置します。99曲ごとの分割も可能です。\n元の曲庫全体をバックアップしてから、並び替えた曲庫で元のパスを置き換えます。曲庫1つ分の空き容量が必要です。",
+        "sorter_src": "元の曲庫（完了後に置換）", "sorter_dst": "バックアップ先（元の曲庫と同階層）",
         "sorter_opt_reverse": "アーケード順（新曲を一番上に配置）",
         "sorter_opt_pagination": "99曲ごとに分割（01 001~099...）",
-        "sorter_opt_boxdef": "box.def 設定ファイルを保持・同期",
-        "sorter_mode_copy": "コピーモード（元のファイルを保持・推奨）",
-        "sorter_mode_move": "移動モード（ファイルを移動して容量節約）",
-        "sorter_start": "並び替えを開始", "sorter_cancel": "キャンセル",
-        "sorter_done": "並び替えが完了しました！", "sorter_open_dst": "📂 出力先フォルダを開く",
-        "sorter_need_src": "有効な元のフォルダを選択してください", "sorter_need_dst": "有効な出力先フォルダを選択してください",
+        "sorter_start": "並び替え・バックアップ・置換", "sorter_cancel": "キャンセル",
+        "sorter_done": "並び替えが完了しました！", "sorter_open_dst": "📂 並び替え後の曲庫を開く",
+        "sorter_need_src": "有効な元のフォルダを選択してください", "sorter_need_dst": "バックアップ先を設定してください",
+        "sorter_busy": "ダウンロードを完了または停止してから並び替えてください。",
         "title": "🎵 ESEManager", "search": "検索", "show_all": "すべて表示",
         "clear": "クリア", "ph": "楽曲名を検索（日本語対応）...", "category": "カテゴリー",
         "all_cat": "すべて", "official": "🌐 公式サイト", "check_missing": "🔍 不足チェック",
+        "miss_checking": "ローカル楽曲をスキャンし、不足曲を確認中…",
+        "miss_progress": "不足曲を確認中… ({d}/{t})",
+        "miss_none": "✓ 不足している曲はありません。すべて存在します",
+        "miss_found": "不足している {n} 曲（{f} ファイル）が見つかりました。\nダウンロードしますか？",
         "download": "⬇ 選択をダウンロード", "sel_all": "全選択", "desel_all": "解除",
         "selected": "{n} 曲選択", "dir": "保存先", "browse": "参照", "workers": "並列数",
         "lang": "言語", "c_sel": "✓", "c_song": "楽曲名", "c_jp": "日本語",
@@ -576,20 +583,207 @@ class SearchThread(QThread):
             self.fail.emit(str(e))
 
 
-def git_blob_sha(path):
+def git_blob_sha(path, lfs=False):
     """計算檔案的 git blob 物件雜湊：sha1(b"blob <size>\\0" + content)。
-    與 git ls-tree 給的 blob sha 同一公式，可精準比對本地檔是否為最新版本。"""
+    與 git ls-tree 給的 blob sha 同一公式；lfs=True 則計算對應指標檔的 blob sha。"""
     size = os.path.getsize(path)
-    h = hashlib.sha1()
-    h.update(b"blob %d\0" % size)
+    h = hashlib.sha256() if lfs else hashlib.sha1()
+    if not lfs:
+        h.update(b"blob %d\0" % size)
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
+    if lfs:
+        pointer = LFS_HEADER + (f"\noid sha256:{h.hexdigest()}\nsize {size}\n").encode("ascii")
+        return hashlib.sha1(b"blob %d\0" % len(pointer) + pointer).hexdigest()
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------- 本地曲庫與架構比對工具
+def normalize_category_key(cat_str):
+    """將各類分類名稱（英/日/官方序號/街機序號）標準化為統一比對鍵"""
+    if not cat_str:
+        return ""
+    low = str(cat_str).lower()
+    if "j-pop" in low or "jpop" in low or "pop" in low:
+        return "pop"
+    if "anime" in low or "アニメ" in low:
+        return "anime"
+    if "vocaloid" in low or "ボーカロイド" in low:
+        return "vocaloid"
+    if any(k in low for k in ("children", "kids", "folk", "キッズ", "どうよう", "童謡")):
+        return "children"
+    if "variety" in low or "バラエティ" in low:
+        return "variety"
+    if "classic" in low or "クラシック" in low:
+        return "classical"
+    if "game" in low or "遊戲" in low or "ゲーム" in low:
+        return "game"
+    if "namco" in low or "ナムコ" in low:
+        return "namco"
+    if "live" in low or "festival" in low:
+        return "live"
+    if "tower" in low:
+        return "tower"
+    if "dan" in low or "dojo" in low:
+        return "dan"
+    return low
+
+
+class LocalSongIndex:
+    """本地曲庫快速索引，支援任何自訂目錄架構（街機分頁、日文分類、子資料夾等）"""
+    def __init__(self, root_dir):
+        self.root_dir = os.path.abspath(root_dir)
+        self.cat_file_map = {}      # (category_key, filename_lower) -> list of full file paths
+        self.file_map = {}          # filename_lower -> list of full file paths
+        self.folder_files = {}      # folder_path -> {filename_lower: full_file_path}
+        self.folder_clean_names = {}# clean_name -> list of folder paths
+        self.build()
+
+    def build(self):
+        if not os.path.isdir(self.root_dir):
+            return
+        for root, dirs, files in os.walk(self.root_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+            if not files:
+                continue
+
+            rel = os.path.relpath(root, self.root_dir)
+            parts = rel.split(os.sep) if rel != '.' else []
+            cat_key = normalize_category_key(parts[0]) if parts else ""
+
+            flset = {}
+            for f in files:
+                fl = f.lower()
+                full = os.path.join(root, f)
+                flset[fl] = full
+                self.file_map.setdefault(fl, []).append(full)
+                if cat_key:
+                    self.cat_file_map.setdefault((cat_key, fl), []).append(full)
+            self.folder_files[root] = flset
+
+            dname = os.path.basename(root)
+            ck = song_sorter.clean_key(dname)
+            if ck:
+                self.folder_clean_names.setdefault(ck, []).append(root)
+
+    def resolve_song_files(self, song, category_name=None):
+        """
+        給定遠端歌曲物件（包含 song['files'] 與 category/base_path），
+        比對並回傳本地真實檔案路徑對應表 {file_path: local_path}。
+        若曲目在本地齊全（所有必要檔案皆存在），則回傳對應字典；
+        若缺檔或不存在，回傳 None。
+        """
+        files = [f for f in song.get("files", []) if f["filename"].lower() != "box.def"]
+        if not files:
+            return None
+
+        # 1. 快速路徑比對：原版 ESE 相對路徑
+        orig_paths = {f["file_path"]: os.path.join(self.root_dir, f["file_path"]) for f in files}
+        if all(os.path.exists(lp) for lp in orig_paths.values()):
+            return orig_paths
+
+        # 2. 索引比對：優先以 .tja 檔名為基準尋找候選資料夾
+        cat_key = normalize_category_key(category_name or song.get("category", ""))
+        tja_files = [f for f in files if f["filename"].lower().endswith(".tja")]
+        primary_file = tja_files[0]["filename"] if tja_files else files[0]["filename"]
+        pfl = primary_file.lower()
+
+        candidates = []
+        if cat_key:
+            candidates.extend(self.cat_file_map.get((cat_key, pfl), []))
+        for p in self.file_map.get(pfl, []):
+            if p not in candidates:
+                candidates.append(p)
+
+        for cand_path in candidates:
+            cand_dir = os.path.dirname(cand_path)
+            cfiles = self.folder_files.get(cand_dir, {})
+            resolved = {}
+            all_found = True
+            for f in files:
+                fnl = f["filename"].lower()
+                if fnl in cfiles:
+                    resolved[f["file_path"]] = cfiles[fnl]
+                else:
+                    all_found = False
+                    break
+            if all_found:
+                return resolved
+
+        # 3. 備用比對：依曲名 clean_key 比對資料夾
+        song_name = song.get("song_name", "")
+        clean_sn = song_sorter.clean_key(song_name)
+        cand_dirs = self.folder_clean_names.get(clean_sn, [])
+        for cand_dir in cand_dirs:
+            cfiles = self.folder_files.get(cand_dir, {})
+            resolved = {}
+            all_found = True
+            for f in files:
+                fnl = f["filename"].lower()
+                if fnl in cfiles:
+                    resolved[f["file_path"]] = cfiles[fnl]
+                else:
+                    all_found = False
+                    break
+            if all_found:
+                return resolved
+
+        return None
+
+
+class CheckMissingThread(QThread):
+    """檢查本地缺少哪些曲目（支援遞迴與自訂分頁目錄結構）。"""
+    progress = Signal(int, int)     # done, total
+    done = Signal(object)           # list[song] (missing songs)
+    fail = Signal(str)
+
+    def __init__(self, download_dir, category=None, has_local=False):
+        super().__init__()
+        self.download_dir = download_dir
+        self.category = category
+        self.has_local = has_local
+
+    def run(self):
+        try:
+            ddir = self.download_dir
+            if not os.path.isdir(ddir):
+                self.fail.emit("__NO_DIR__")
+                return
+
+            idx = LocalSongIndex(ddir)
+
+            d = SongDownloader(db_path=DB_PATH)
+            songs = d.search_songs(keyword=None, category=self.category)
+            d.close()
+
+            valid_songs = []
+            for s in songs:
+                s["files"] = [f for f in s["files"] if f["filename"].lower() != "box.def"]
+                if s["files"]:
+                    valid_songs.append(s)
+
+            total = len(valid_songs)
+            missing = []
+            for i, s in enumerate(valid_songs, start=1):
+                res = idx.resolve_song_files(s, self.category)
+                if not res:
+                    missing.append(s)
+                else:
+                    invalid = [dict(f, local_path=res[f["file_path"]]) for f in s["files"]
+                               if is_lfs_pointer(res[f["file_path"]])]
+                    if invalid:
+                        missing.append(dict(s, files=invalid))
+                if i % 50 == 0 or i == total:
+                    self.progress.emit(i, total)
+
+            self.done.emit(missing)
+        except Exception as e:
+            self.fail.emit(str(e))
+
+
 class CheckUpdatesThread(QThread):
-    """檢查已下載的檔案是否被上游更新（比對 git blob sha）。"""
+    """檢查已下載的檔案是否被上游更新（比對 git blob sha，支援新舊架構）。"""
     progress = Signal(int, int)     # done, total
     done = Signal(object)           # list[song]（只含有更新的檔案）
     fail = Signal(str)
@@ -601,11 +795,17 @@ class CheckUpdatesThread(QThread):
 
     def run(self):
         try:
+            ddir = self.download_dir
+            if not os.path.isdir(ddir):
+                self.fail.emit("__NO_DIR__")
+                return
+
+            idx = LocalSongIndex(ddir)
+
             d = SongDownloader(db_path=DB_PATH)
             songs = d.search_songs(keyword=None, category=self.category)
             d.close()
 
-            # file_path -> blob_sha（權威值，來自 ese_songs.db）
             conn = sqlite3.connect(DB_PATH)
             try:
                 sha_map = {fp: sha for fp, sha in conn.execute(
@@ -614,21 +814,23 @@ class CheckUpdatesThread(QThread):
             finally:
                 conn.close()
             if not sha_map:
-                # 舊資料庫沒有 blob_sha：請使用者先更新資料庫
                 self.fail.emit("__NO_SHA__")
                 return
 
-            ddir = self.download_dir
             candidates = []     # (song, file, local_path, remote_sha)
             for s in songs:
+                resolved = idx.resolve_song_files(s, self.category)
+                if not resolved:
+                    continue
                 for f in s["files"]:
                     if f["filename"].lower() == "box.def":
                         continue
                     sha = sha_map.get(f["file_path"])
                     if not sha:
                         continue
-                    lp = os.path.join(ddir, f["file_path"])
-                    if os.path.exists(lp):
+                    lp = resolved.get(f["file_path"])
+                    if lp and os.path.exists(lp):
+                        f["local_path"] = lp
                         candidates.append((s, f, lp, sha))
 
             total = len(candidates)
@@ -637,7 +839,12 @@ class CheckUpdatesThread(QThread):
             def check(item):
                 s, f, lp, sha = item
                 try:
-                    return (s, f) if git_blob_sha(lp) != sha else None
+                    if is_lfs_pointer(lp):
+                        return s, f
+                    # LFS entries record the pointer blob SHA, not the audio content SHA.
+                    if git_blob_sha(lp) != sha and git_blob_sha(lp, lfs=True) != sha:
+                        return s, f
+                    return None
                 except Exception:
                     return None
 
@@ -727,9 +934,9 @@ class DownloadThread(QThread):
             self._pause.wait()        # 暫停時在此等待（檔案開始前）
             if self._stop:
                 return
-            save_path = os.path.join(self.download_dir, f["file_path"])
+            save_path = f.get("local_path") or os.path.join(self.download_dir, f["file_path"])
             disp = f["filename"]
-            if os.path.exists(save_path) and not self.overwrite:
+            if os.path.exists(save_path) and not self.overwrite and not is_lfs_pointer(save_path):
                 with self._lock:
                     self.done += 1
                     self.skip += 1
@@ -768,6 +975,8 @@ class DownloadThread(QThread):
                             spd = (got / 1024 / 1024) / fe if fe > 0 else 0
                             pct = (got / clen * 100) if clen else 50.0
                             self._mark(f["file_path"], "downloading", pct, spd)
+                if is_lfs_pointer(save_path):
+                    raise ValueError("伺服器回傳 Git LFS 指標，並非實際檔案內容")
                 with self._lock:
                     self.done += 1
                     self.dl += 1
@@ -1920,12 +2129,14 @@ class SongSorterDialog(QDialog):
         self.tr = tr
         self.start_dir = start_dir
         self._thread = None
+        self._output_path = ""
         self.setWindowTitle(tr("sorter_title"))
         self.resize(760, 580)
 
         root = QVBoxLayout(self)
 
         hint = QLabel(self.tr("sorter_hint"))
+        hint.setWordWrap(True)
         hint.setStyleSheet("color:#ddd; background:#2A2D32; padding:10px; border-radius:6px;")
         root.addWidget(hint)
 
@@ -1935,15 +2146,8 @@ class SongSorterDialog(QDialog):
         self.src_edit = QLineEdit(self.start_dir)
         form.addRow(self.tr("sorter_src"), self._with_browse(self.src_edit, lambda: self._pick_dir(self.src_edit, True)))
 
-        # 目的目錄
-        default_dst = ""
-        if self.start_dir and os.path.isdir(self.start_dir):
-            parent_dir = os.path.dirname(os.path.abspath(self.start_dir))
-            base_name = os.path.basename(os.path.abspath(self.start_dir))
-            if base_name.lower() == 'songs':
-                default_dst = os.path.join(parent_dir, "song_revise")
-            else:
-                default_dst = os.path.join(parent_dir, f"{base_name}_revise")
+        # 原曲庫的備份目錄；排序結果會放回來源路徑。
+        default_dst = song_sorter.default_backup_dir(self.start_dir) if self.start_dir else ""
         self.dst_edit = QLineEdit(default_dst)
         form.addRow(self.tr("sorter_dst"), self._with_browse(self.dst_edit, lambda: self._pick_dir(self.dst_edit, False)))
 
@@ -1960,19 +2164,6 @@ class SongSorterDialog(QDialog):
         self.opt_pagination = QCheckBox(self.tr("sorter_opt_pagination"))
         self.opt_pagination.setChecked(True)
         opts_layout.addWidget(self.opt_pagination)
-
-        self.opt_boxdef = QCheckBox(self.tr("sorter_opt_boxdef"))
-        self.opt_boxdef.setChecked(True)
-        opts_layout.addWidget(self.opt_boxdef)
-
-        mode_row = QHBoxLayout()
-        self.mode_copy = QRadioButton(self.tr("sorter_mode_copy"))
-        self.mode_copy.setChecked(True)
-        self.mode_move = QRadioButton(self.tr("sorter_mode_move"))
-        mode_row.addWidget(self.mode_copy)
-        mode_row.addWidget(self.mode_move)
-        mode_row.addStretch()
-        opts_layout.addLayout(mode_row)
 
         root.addWidget(opts_gb)
 
@@ -2027,13 +2218,8 @@ class SongSorterDialog(QDialog):
                                              edit.text() or self.start_dir)
         if d:
             edit.setText(d)
-            if is_src and not self.dst_edit.text():
-                p_dir = os.path.dirname(os.path.abspath(d))
-                b_name = os.path.basename(os.path.abspath(d))
-                if b_name.lower() == 'songs':
-                    self.dst_edit.setText(os.path.join(p_dir, "song_revise"))
-                else:
-                    self.dst_edit.setText(os.path.join(p_dir, f"{b_name}_revise"))
+            if is_src:
+                self.dst_edit.setText(song_sorter.default_backup_dir(d))
 
     def run_sorter(self):
         src = self.src_edit.text().strip()
@@ -2049,13 +2235,14 @@ class SongSorterDialog(QDialog):
             "reverse_order": self.opt_reverse.isChecked(),
             "batch_size": 99 if self.opt_pagination.isChecked() else 0,
             "use_pagination": self.opt_pagination.isChecked(),
-            "sync_boxdef": self.opt_boxdef.isChecked(),
-            "move_mode": self.mode_move.isChecked()
         }
 
         self.start_btn.setEnabled(False)
+        self.src_edit.setEnabled(False)
+        self.dst_edit.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.open_dst_btn.setEnabled(False)
+        self._output_path = ""
         self.progress_bar.setValue(0)
         self.log_view.clear()
 
@@ -2070,6 +2257,12 @@ class SongSorterDialog(QDialog):
             self._thread.cancel()
             self.cancel_btn.setEnabled(False)
 
+    def reject(self):
+        if self._thread and self._thread.isRunning():
+            self.cancel_sorter()
+            return
+        super().reject()
+
     def _on_progress(self, cur, total, name):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(cur)
@@ -2079,15 +2272,18 @@ class SongSorterDialog(QDialog):
 
     def _on_finished(self, ok, msg, stats):
         self.start_btn.setEnabled(True)
+        self.src_edit.setEnabled(True)
+        self.dst_edit.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         if ok:
+            self._output_path = stats["output_path"]
             self.open_dst_btn.setEnabled(True)
             QMessageBox.information(self, self.tr("sorter_title"), msg)
         else:
             QMessageBox.warning(self, self.tr("sorter_title"), msg)
 
     def open_dst_folder(self):
-        d = self.dst_edit.text().strip()
+        d = self._output_path
         if os.path.isdir(d):
             os.startfile(d)
 
@@ -2659,33 +2855,40 @@ class MainWindow(QMainWindow):
 
     # ---- check missing
     def check_missing(self):
+        ddir = self.dir_edit.text()
+        if not os.path.isdir(ddir):
+            QMessageBox.warning(self, self.tr("check_missing"), self.tr("boxdef_no_dir"))
+            return
         self.missing_btn.setEnabled(False)
-        self._miss = SearchThread("", None, self.has_local)
+        self.log_view.appendPlainText("▶ " + self.tr("miss_checking"))
+        cat = self.cat_combo.currentData()
+        self._miss = CheckMissingThread(ddir, category=cat, has_local=self.has_local)
+        self._miss.progress.connect(
+            lambda d, t: self.count_label.setText(self.tr("miss_progress", d=d, t=t)))
         self._miss.done.connect(self.on_missing_loaded)
-        self._miss.fail.connect(lambda e: (QMessageBox.critical(self, "", e),
-                                           self.missing_btn.setEnabled(True)))
+        self._miss.fail.connect(self._on_missing_fail)
         self._miss.start()
 
-    def on_missing_loaded(self, songs):
+    def _on_missing_fail(self, e):
         self.missing_btn.setEnabled(True)
-        ddir = self.dir_edit.text()
-        missing = []
-        for s in songs:
-            for f in s["files"]:
-                if not os.path.exists(os.path.join(ddir, f["file_path"])):
-                    missing.append(s)
-                    break
+        if e == "__NO_DIR__":
+            QMessageBox.warning(self, self.tr("check_missing"), self.tr("boxdef_no_dir"))
+        else:
+            QMessageBox.critical(self, self.tr("check_missing"), str(e))
+
+    def on_missing_loaded(self, missing):
+        self.missing_btn.setEnabled(True)
         if not missing:
-            QMessageBox.information(self, self.tr("check_missing"), "✓ 沒有缺漏")
+            self.count_label.setText(self.tr("total", n=0))
+            QMessageBox.information(self, self.tr("check_missing"), self.tr("miss_none"))
             return
         files = [(s, f) for s in missing for f in s["files"]]
+        self.song_model.set_songs(missing)
+        self.song_model.set_all(True)
+        self.count_label.setText(self.tr("total", n=len(missing)))
         if QMessageBox.question(
                 self, self.tr("check_missing"),
-                f"發現 {len(missing)} 首缺漏（{len(files)} 檔），是否下載？") \
-                == QMessageBox.Yes:
-            self.song_model.set_songs(missing)
-            self.song_model.set_all(True)
-            self.count_label.setText(self.tr("total", n=len(missing)))
+                self.tr("miss_found", n=len(missing), f=len(files))) == QMessageBox.Yes:
             self.start_download(files)
 
     # ---- check updates（比對 git blob sha，找出上游已更新的已下載檔案）
@@ -2742,6 +2945,9 @@ class MainWindow(QMainWindow):
         BoxDefDialog(self, start, self.tr).exec()
 
     def open_song_sorter(self):
+        if self.dl_thread and self.dl_thread.isRunning():
+            QMessageBox.warning(self, self.tr("sorter_title"), self.tr("sorter_busy"))
+            return
         start = self.dir_edit.text() if os.path.isdir(self.dir_edit.text()) else os.getcwd()
         SongSorterDialog(self, self.tr, start).exec()
 
@@ -2868,6 +3074,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "資料庫更新", msg)
 
 
+def _parse_db_version(text):
+    version = text.strip()
+    if not re.fullmatch(r"[^\s<>\x00-\x1f]{1,128}", version):
+        raise ValueError("更新伺服器未回傳有效版本；請使用「更新資料庫」從 ESE 重建。")
+    return version
+
+
+def _validate_db_download(path, name):
+    with open(path, "rb") as f:
+        if f.read(16) != b"SQLite format 3\x00":
+            raise ValueError(f"{name} 不是 SQLite 資料庫（伺服器可能回傳網頁）；原檔已保留。")
+    required = {"songs", "categories", "song_files"} if name == DB_PATH else {"local_songs"}
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        if conn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError(f"{name} 完整性檢查失敗；原檔已保留。")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not required <= tables:
+            raise ValueError(f"{name} 缺少必要資料表；原檔已保留。")
+
+
 class VersionThread(QThread):
     result = Signal(str, str)  # remote, local
 
@@ -2878,13 +3104,13 @@ class VersionThread(QThread):
             r = requests.get("https://taikozhong.me/tjamanager/version.txt",
                              timeout=10, verify=False)
             r.raise_for_status()
-            remote = r.text.strip()
+            remote = _parse_db_version(r.text)
         except Exception as e:
             print("version:", e)
         if os.path.exists("version.txt"):
             try:
                 with open("version.txt", encoding="utf-8") as f:
-                    local = f.read().strip()
+                    local = _parse_db_version(f.read())
             except Exception:
                 pass
         self.result.emit(remote, local)
@@ -2901,16 +3127,24 @@ class DBUpdateThread(QThread):
     def run(self):
         base = "https://taikozhong.me/tjamanager/"
         try:
-            for name in ("ese_songs.db", "ese_local.db"):
-                self.log.emit(f"下載資料庫 {name} …")
-                r = requests.get(base + name, stream=True, timeout=120, verify=False)
-                r.raise_for_status()
-                with open(name, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
-            with open("version.txt", "w", encoding="utf-8") as f:
-                f.write(self.version)
+            version = _parse_db_version(self.version)
+            # Both downloads must validate before either existing database is replaced.
+            with tempfile.TemporaryDirectory(prefix=".db-update-", dir=".") as staging:
+                for name in (DB_PATH, LOCAL_DB_PATH):
+                    self.log.emit(f"下載資料庫 {name} …")
+                    path = os.path.join(staging, name)
+                    with closing(requests.get(base + name, stream=True, timeout=120,
+                                              verify=False)) as r:
+                        r.raise_for_status()
+                        with open(path, "wb") as f:
+                            for chunk in r.iter_content(8192):
+                                if chunk:
+                                    f.write(chunk)
+                    _validate_db_download(path, name)
+                with open(os.path.join(staging, "version.txt"), "w", encoding="utf-8") as f:
+                    f.write(version)
+                for name in (DB_PATH, LOCAL_DB_PATH, "version.txt"):
+                    os.replace(os.path.join(staging, name), name)
             self.done.emit(True, "ok")
         except Exception as e:
             self.done.emit(False, str(e))

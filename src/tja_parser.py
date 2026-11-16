@@ -144,12 +144,24 @@ class TJAParser:
         Returns:
             分類名稱
         """
+        if base_dir:
+            try:
+                rel = Path(file_path).resolve().relative_to(Path(base_dir).resolve())
+                parts = rel.parts
+                if len(parts) > 1:
+                    return parts[0]
+            except Exception:
+                pass
+
         path_parts = Path(file_path).parts
 
-        # 尋找分類資料夾（通常以數字開頭）
+        # 尋找分類資料夾（通常以數字開頭，如 01-J-POP, 01 Pop, 02-アニメ）
         for part in path_parts:
-            # 檢查是否符合分類格式（例如 "01 Pop", "02 Anime"）
-            if re.match(r'^\d{2}\s+', part):
+            # 排除分頁資料夾（例如 "01 001~099", "02 100~198"）
+            if re.match(r'^\d{2}\s+\d+~', part):
+                continue
+            # 檢查是否符合分類格式（例如 "01 Pop", "01-J-POP", "02 Anime", "02-アニメ"）
+            if re.match(r'^\d{2}[-_\s]+', part):
                 return part
 
         return None

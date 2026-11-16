@@ -19,6 +19,10 @@ from the **ESE (Every Song Ever)** project.
   - Sorts downloaded songs in Taiko arcade (Nijiiro ver.) reverse-chronological order (newest songs on top)
   - Automatically batches songs into 99-song folders (`01 001~099`...) with clean prefixes, ready to play in TJAPlayer3 / TaikoNijiiroDondaEX
   - Automatically preserves and syncs `box.def` genre definitions
+  - Uses bundled arcade release dates; songs with unknown dates go last in each category and are listed in the log
+  - Builds a complete sorted copy, renames the original library to a sibling `song_backup`, then installs the sorted copy at the original path
+  - Existing backups are preserved with names such as `song_backup_2`; failed or cancelled runs never install an incomplete library, and installation failures trigger a rollback attempt
+  - Keeps the full original backup and preserves `box.def`, Dan files and other assets in the sorted library; requires space for one full copy. Stop downloads and other library edits before sorting
 - **Dan tools** (🥋):
   - **Dan Generator** — turn a Taiko Wiki Dan-dojo page URL into TaikøNauts-compatible Dan files (`dan.def` + per-rank `Dan.json`) from the rank names and clear conditions
   - **Dan Convertor** — convert an OpenTaiko-style Dan `.tja` (multiple songs split by `#NEXTSONG`) into TaikøNauts-compatible Dan files
